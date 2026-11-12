@@ -189,6 +189,26 @@ function lerpAngle(a, b, t) {
   return a + diff * t;
 }
 
+// ---------- Seeded randomness: the same place looks the same every time ----------
+// The endless savanna is built from tiles. Everything on a tile is drawn from a generator seeded with the tile's
+// coordinates (never Math.random), so walking away and coming back brings back the very same trees and rocks.
+function cellHash(a, b, salt) {
+  let h = (Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul(b | 0, 0x165667b1) ^ Math.imul((salt | 0) + 0x7f4a7c15, 0x9e3779b1)) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+function seededRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // ---------- Scene / camera / renderer ----------
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87ceeb);
@@ -499,12 +519,11 @@ function groundRelief(shader) {
 }
 // Rolling terrain. Everything that stands on the ground asks this function for its height.
 function rawTerrain(x, z) {
-  // the small bumps fade out beyond the detailed area, where the ground mesh is coarse
-  const detail = 1 - smoothstep(205, 260, Math.max(Math.abs(x), Math.abs(z)));
+  // the same everywhere, however far from the start: the land has no edge
   return 2.6 * Math.sin(x * 0.021 + 1.3) * Math.cos(z * 0.017)
        + 1.8 * Math.sin(x * 0.043 + z * 0.037)
-       + detail * (0.9 * Math.sin(z * 0.09 + 0.5) * Math.sin(x * 0.07)
-                 + 0.35 * Math.sin(x * 0.19 + 1.0) * Math.sin(z * 0.16 + 2.0));
+       + 0.9 * Math.sin(z * 0.09 + 0.5) * Math.sin(x * 0.07)
+       + 0.35 * Math.sin(x * 0.19 + 1.0) * Math.sin(z * 0.16 + 2.0);
 }
 // The waters: a big deep lake, a shallow pond and a small pan. Their shorelines are irregular, not circles.
 //   r: nominal radius;  basin: how deep the hollow is dug;  flat: how far out (in shore radii) the land is levelled towards it;
@@ -612,52 +631,22 @@ function tintDrift(x, z) {
   return 0.5 + 0.5 * Math.sin(x * 0.013 + 4.0 + Math.sin(z * 0.021) * 1.5) * Math.cos(z * 0.011 + 1.0);
 }
 
-const groundGeo = new THREE.PlaneGeometry(400, 400, 260, 260).rotateX(-Math.PI / 2);
-{
-  // savanna palette: lush in the dips, straw on the rises, reddish earth patches, a golden drift on top
-  const cLush  = new THREE.Color(0x7d9a45);
-  const cStraw = new THREE.Color(0xcab762);
-  const cGold  = new THREE.Color(0xd9b24f);
-  const cEarth = new THREE.Color(0xb07f52);
-  const cDark  = new THREE.Color(0x8a6844);
-  const cMud   = new THREE.Color(0x57452f);
-  const col = new THREE.Color(), earth = new THREE.Color();
-  const p = groundGeo.attributes.position;
-  const colors = new Float32Array(p.count * 3), bare = new Float32Array(p.count);
-  for (let i = 0; i < p.count; i++) {
-    const x = p.getX(i), z = p.getZ(i);
-    p.setY(i, terrainHeight(x, z));
-    bare[i] = earthAmount(x, z);
-    const fine = 0.5 + 0.5 * Math.sin(x * 0.37 + Math.sin(z * 0.29) * 1.7) * Math.sin(z * 0.41 + 0.7);  // small mottling
-    col.copy(cLush).lerp(cStraw, dryness(x, z))
-       .lerp(cGold, tintDrift(x, z) * 0.35);
-    earth.copy(cEarth).lerp(cDark, fine * 0.5);
-    col.lerp(earth, earthAmount(x, z) * 0.8);
-    col.multiplyScalar(0.88 + fine * 0.14 + Math.random() * 0.08);
-    const depth = waterDepth(x, z);
-    if (depth > -0.6) {
-      col.lerp(cMud, smoothstep(-0.6, 0.0, depth) * 0.85);       // wet mud towards the waterline
-      col.multiplyScalar(1 - 0.5 * smoothstep(0, 1.0, depth) - 0.25 * smoothstep(1.0, 4.5, depth));   // darker the deeper the bed
-    }
-    colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
-  }
-  groundGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  groundGeo.setAttribute('bare', new THREE.BufferAttribute(bare, 1));
-  groundGeo.computeVertexNormals();
-}
-const ground = new THREE.Mesh(
-  groundGeo,
-  new THREE.MeshStandardMaterial({ map: makeGrassTexture(), vertexColors: true, roughness: 1.0, bumpMap: makeGroundRelief(), bumpScale: 1.0 })
-);
-ground.material.onBeforeCompile = groundRelief;
-ground.receiveShadow = true;
-scene.add(ground);
+// The ground itself is built tile by tile (see "The endless savanna" below). These are the materials all tiles share.
+// The textures run on world coordinates, so they continue seamlessly from one tile to the next.
+const groundMat = new THREE.MeshStandardMaterial({ map: makeGrassTexture(), vertexColors: true, roughness: 1.0, bumpMap: makeGroundRelief(), bumpScale: 1.0 });
+groundMat.onBeforeCompile = groundRelief;
+const ground = { material: groundMat };     // (the weather tints it after rain)
+// far away the relief is left out: a plain textured ground
+const farGroundMat = new THREE.MeshStandardMaterial({ map: groundMat.map.clone(), vertexColors: true, roughness: 1.0 });
+farGroundMat.map.needsUpdate = true;
+farGroundMat.onBeforeCompile = breakTiling;
 
 // ----- Grass: three kinds of thin-bladed tufts, drawn as instanced meshes, swaying in the wind -----
 const GRASS_DENSITY = 1.0;          // lower this (e.g. 0.5) if the scene runs slowly
 const windUniform = { value: 0 };   // the wind's clock, advanced in the render loop (faster in a storm)
 const windStrength = { value: 1 };  // how far the grass bends: 1 = a breeze, about 3 = a storm
 let wetGrassMat = null;             // the grass material, tinted greener after rain
+let grassKinds = null;            // the tuft shapes (filled in below)
 // Up to eight animals near the player push the grass aside: each entry is (x, z, reach, unused).
 const GRASS_PUSHERS = 8;
 const grassPushers = { value: Array.from({ length: GRASS_PUSHERS }, () => new THREE.Vector4(1e6, 1e6, 0.001, 0)) };
@@ -753,188 +742,30 @@ function tallGrassAmount(x, z) {
         #endif`);
   };
 
-  const dummy = new THREE.Object3D();
-  const c = new THREE.Color();
-  // scatter `count` tufts; `chance(x, z)` decides where they may grow, `style` sets size and colour
-  function plant(geo, count, chance, style, minDist = 0, maxDist = 198) {
-    count = Math.round(count * GRASS_DENSITY);
-    const mesh = new THREE.InstancedMesh(geo, grassMat, count);
-    noReflection.push(mesh);
-    let placed = 0, tries = 0;
-    while (placed < count && tries < count * 12) {
-      tries++;
-      const angle = Math.random() * Math.PI * 2;
-      const dist = Math.sqrt(minDist * minDist + Math.random() * (maxDist * maxDist - minDist * minDist)); // even spread
-      const x = Math.cos(angle) * dist, z = Math.sin(angle) * dist;
-      if (Math.random() > chance(x, z)) continue;
-      if (waterDepth(x, z) > -0.12) continue;                      // nothing grows in the water or right at its edge
-      dummy.position.set(x, terrainHeight(x, z), z);
-      dummy.rotation.y = Math.random() * Math.PI * 2;
-      style(x, z, dummy.scale, c);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(placed, dummy.matrix);
-      mesh.setColorAt(placed, c);
-      placed++;
-    }
-    mesh.count = placed;
-    mesh.receiveShadow = true;
-    mesh.frustumCulled = false;   // covers the whole map anyway
-    scene.add(mesh);
-  }
-
-  const cLush = new THREE.Color(0x7a9742), cStraw = new THREE.Color(0xc9b869), cPale = new THREE.Color(0xddd09a);
-  const cGoldA = new THREE.Color(0xd3bb6e), cGoldB = new THREE.Color(0xb79f58);
-  // green in the dips, straw on the rises, with some random spread and the odd bleached tuft
-  const fieldColour = (x, z, col) => {
-    col.copy(cLush).lerp(cStraw, Math.min(1, Math.max(0, dryness(x, z) + (Math.random() - 0.5) * 0.5)));
-    if (Math.random() < 0.1) col.lerp(cPale, 0.7);
-    col.multiplyScalar(0.82 + Math.random() * 0.34);
+  // the five kinds of tuft; every tile draws its own copies of these
+  grassKinds = {
+    mat: grassMat,
+    turf: tuftGeometry({ blades: 9, hMin: 0.18, hMax: 0.5, halfWidth: 0.018, spread: 0.3, lean: 0.5, bent: false, tipShade: 1.0 }),
+    medium: tuftGeometry({ blades: 7, hMin: 0.5, hMax: 1.15, halfWidth: 0.022, spread: 0.16, lean: 0.45, bent: true, tipShade: 1.05 }),
+    tall: tuftGeometry({ blades: 9, hMin: 1.5, hMax: 2.9, halfWidth: 0.02, spread: 0.22, lean: 0.28, bent: true, tipShade: 1.35 }),
+    // further out: coarser tufts, so that fewer of them cover the ground
+    coarse: tuftGeometry({ blades: 6, hMin: 0.3, hMax: 0.95, halfWidth: 0.034, spread: 0.42, lean: 0.5, bent: false, tipShade: 1.0 }),
+    coarseTall: tuftGeometry({ blades: 7, hMin: 1.5, hMax: 2.9, halfWidth: 0.032, spread: 0.3, lean: 0.28, bent: false, tipShade: 1.35 }),
   };
-
-  // 1) short turf: lots of small, fine tufts that carpet the ground
-  plant(
-    tuftGeometry({ blades: 9, hMin: 0.18, hMax: 0.5, halfWidth: 0.018, spread: 0.3, lean: 0.5, bent: false, tipShade: 1.0 }),
-    130000,
-    (x, z) => 0.1 + 0.9 * grassDensity(x, z),
-    (x, z, scale, col) => {
-      const s = 0.7 + Math.random() * 0.8;
-      scale.set(s, s * (0.6 + Math.random() * 0.9), s);
-      fieldColour(x, z, col);
-    });
-
-  // 2) medium tufts: curved blades of very mixed size, thicker where it is lush
-  plant(
-    tuftGeometry({ blades: 7, hMin: 0.5, hMax: 1.15, halfWidth: 0.022, spread: 0.16, lean: 0.45, bent: true, tipShade: 1.05 }),
-    65000,
-    (x, z) => { const d = grassDensity(x, z); return d * d; },
-    (x, z, scale, col) => {
-      const s = 0.6 + Math.random() * Math.random() * 1.6;       // mostly small, a few big ones
-      scale.set(s, s * (0.7 + Math.random() * 0.8) * (1.25 - 0.45 * dryness(x, z)), s);
-      fieldColour(x, z, col);
-    });
-
-  // 3) tall savanna grass: long golden stalks with pale tips, growing in stands
-  plant(
-    tuftGeometry({ blades: 9, hMin: 1.5, hMax: 2.9, halfWidth: 0.02, spread: 0.22, lean: 0.28, bent: true, tipShade: 1.35 }),
-    16000,
-    (x, z) => tallGrassAmount(x, z),
-    (x, z, scale, col) => {
-      const s = 0.75 + Math.random() * 0.6;
-      scale.set(s, s * (0.7 + Math.random() * 0.7), s);
-      col.copy(cGoldA).lerp(cGoldB, Math.random()).lerp(cLush, (1 - dryness(x, z)) * 0.35);
-      col.multiplyScalar(0.85 + Math.random() * 0.25);
-    });
-
-  // 4) beyond the field: the grass carries on at nearly the same thickness for a good way and then thins out
-  //    slowly, so that there is no line where it stops. The tufts are coarser, so fewer of them cover the ground.
-  const fade = d => 1 - 0.72 * smoothstep(205, 310, d) - 0.28 * smoothstep(310, 440, d);
-  plant(
-    tuftGeometry({ blades: 6, hMin: 0.3, hMax: 0.95, halfWidth: 0.034, spread: 0.42, lean: 0.5, bent: false, tipShade: 1.0 }),
-    115000,
-    (x, z) => (0.12 + 0.88 * grassDensity(x, z)) * fade(Math.hypot(x, z)),
-    (x, z, scale, col) => {
-      const s = 1.0 + Math.random() * 1.3;
-      scale.set(s, s * (0.6 + Math.random() * 0.8), s);
-      fieldColour(x, z, col);
-    }, 196, 440);
-  // ...and so do the stands of tall grass
-  plant(
-    tuftGeometry({ blades: 7, hMin: 1.5, hMax: 2.9, halfWidth: 0.032, spread: 0.3, lean: 0.28, bent: false, tipShade: 1.35 }),
-    9000,
-    (x, z) => tallGrassAmount(x, z) * fade(Math.hypot(x, z)),
-    (x, z, scale, col) => {
-      const s = 0.9 + Math.random() * 0.8;
-      scale.set(s, s * (0.7 + Math.random() * 0.7), s);
-      col.copy(cGoldA).lerp(cGoldB, Math.random()).lerp(cLush, (1 - dryness(x, z)) * 0.35);
-      col.multiplyScalar(0.85 + Math.random() * 0.25);
-    }, 196, 420);
 }
 
-// ----- Pebbles: small stones, mostly on the bare earth patches -----
-{
-  const COUNT = 2500;
-  const pebbleMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, flatShading: true });
-  const pebbles = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 0), pebbleMat, COUNT);
-  noReflection.push(pebbles);
-  const dummy = new THREE.Object3D();
-  const greys = [0x9a948a, 0x857c70, 0xb0a696, 0x74695c].map(c => new THREE.Color(c));
-  let placed = 0, tries = 0;
-  while (placed < COUNT && tries < COUNT * 40) {
-    tries++;
-    const angle = Math.random() * Math.PI * 2;
-    const dist = Math.sqrt(Math.random()) * 198;
-    const px = Math.cos(angle) * dist, pz = Math.sin(angle) * dist;
-    if (Math.random() > 0.08 + earthAmount(px, pz)) continue;
-    const s = 0.06 + Math.random() * 0.16;
-    dummy.position.set(px, terrainHeight(px, pz) + s * 0.2, pz);
-    dummy.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
-    dummy.scale.set(s * (1 + Math.random() * 0.6), s * (0.5 + Math.random() * 0.4), s * (1 + Math.random() * 0.4));
-    dummy.updateMatrix();
-    pebbles.setMatrixAt(placed, dummy.matrix);
-    pebbles.setColorAt(placed, greys[(Math.random() * greys.length) | 0]);
-    placed++;
-  }
-  pebbles.count = placed;
-  pebbles.receiveShadow = true;
-  pebbles.frustumCulled = false;
-  scene.add(pebbles);
-}
-
-// ----- Litter: dry stalks and twigs, clods of earth and old dung, so that open ground is not empty -----
-{
-  // scatter `count` copies of `geo`; `chance(x, z)` says how likely a spot is taken, `place(dummy, x, z)` sets size and attitude
-  const scatter = (geo, count, colours, chance, place) => {
-    const mesh = new THREE.InstancedMesh(geo, new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, flatShading: true }), count);
-    noReflection.push(mesh);
-    const dummy = new THREE.Object3D(), tones = colours.map(c => new THREE.Color(c));
-    let placed = 0;
-    for (let tries = 0; placed < count && tries < count * 40; tries++) {
-      const angle = Math.random() * Math.PI * 2, dist = Math.sqrt(Math.random()) * 198;
-      const x = Math.cos(angle) * dist, z = Math.sin(angle) * dist;
-      if (waterDepth(x, z) > -0.05 || Math.random() > chance(x, z)) continue;
-      place(dummy, x, z);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(placed, dummy.matrix);
-      mesh.setColorAt(placed++, tones[(Math.random() * tones.length) | 0]);
-    }
-    mesh.count = placed;
-    mesh.receiveShadow = true;
-    mesh.frustumCulled = false;
-    scene.add(mesh);
-  };
-  // dry stalks and twigs lying flat, everywhere, a few more where the grass is thin
-  scatter(new THREE.CylinderGeometry(0.5, 0.35, 1, 4).rotateZ(Math.PI / 2), 5000, [0xcdb980, 0xb89f6a, 0x8f7350, 0x6f5a41],
-    (x, z) => 0.35 + 0.5 * earthAmount(x, z),
-    (d, x, z) => {
-      const len = 0.25 + Math.random() * Math.random() * 1.4, thick = 0.012 + Math.random() * 0.02;
-      d.position.set(x, terrainHeight(x, z) + thick * 0.4, z);
-      d.rotation.set(0, Math.random() * Math.PI, (Math.random() - 0.5) * 0.12);
-      d.scale.set(len, thick, thick);
-    });
-  // clods of earth on the bare patches
-  scatter(new THREE.IcosahedronGeometry(1, 1), 2200, [0xa97a50, 0x94683f, 0xb98a5e, 0x7f5a3a],
-    (x, z) => 0.03 + 0.95 * earthAmount(x, z),
-    (d, x, z) => {
-      const s = 0.05 + Math.random() * Math.random() * 0.3;
-      d.position.set(x, terrainHeight(x, z) + s * 0.15, z);
-      d.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
-      d.scale.set(s * (1 + Math.random() * 0.8), s * (0.35 + Math.random() * 0.35), s * (1 + Math.random() * 0.5));
-    });
-  // old dung: small heaps of dark balls, bleached with age
-  {
-    let heap = null, left = 0;
-    scatter(new THREE.IcosahedronGeometry(1, 1), 420, [0x4a3d2c, 0x5b4c36, 0x6e604a, 0x3c3124],
-      () => (left > 0 ? 1 : 0.5),
-      (d, x, z) => {
-        if (left <= 0) { heap = { x, z }; left = 4 + ((Math.random() * 6) | 0); }
-        left--;
-        const hx = heap.x + (Math.random() - 0.5) * 0.7, hz = heap.z + (Math.random() - 0.5) * 0.7, s = 0.07 + Math.random() * 0.07;
-        d.position.set(hx, terrainHeight(hx, hz) + s * 0.5, hz);
-        d.rotation.set(Math.random() * 3, Math.random() * 3, 0);
-        d.scale.set(s, s * 0.75, s * 1.1);
-      });
-  }
-}
+// ----- Pebbles and litter: small things strewn over the ground, drawn by the tiles close to you -----
+const PEBBLES = {   // small stones, mostly on the bare earth patches
+  geo: new THREE.IcosahedronGeometry(1, 0),
+  mat: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, flatShading: true }),
+  tones: [0x9a948a, 0x857c70, 0xb0a696, 0x74695c].map(c => new THREE.Color(c)),
+};
+const LITTER_MAT = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, flatShading: true });
+const LITTER = {    // dry stalks and twigs, clods of earth and old dung, so that open ground is not empty
+  stalk: { geo: new THREE.CylinderGeometry(0.5, 0.35, 1, 4).rotateZ(Math.PI / 2), tones: [0xcdb980, 0xb89f6a, 0x8f7350, 0x6f5a41].map(c => new THREE.Color(c)) },
+  clod:  { geo: new THREE.IcosahedronGeometry(1, 1), tones: [0xa97a50, 0x94683f, 0xb98a5e, 0x7f5a3a].map(c => new THREE.Color(c)) },
+  dung:  { geo: new THREE.IcosahedronGeometry(1, 1), tones: [0x4a3d2c, 0x5b4c36, 0x6e604a, 0x3c3124].map(c => new THREE.Color(c)) },
+};
 
 // Move vertices randomly for a rougher, more natural shape.
 // Vertices that share a position move together, so no cracks open up.
@@ -1063,56 +894,7 @@ function freeSpot(minDist, maxDist, r) {
   }
   return null;
 }
-function scatter(count, make, clearRadius) {
-  for (let i = 0; i < count; i++) {
-    const spot = freeSpot(8, 188, clearRadius);
-    if (!spot) continue;
-    const { x, z } = spot;
-    obstacles.push({ x, z, r: clearRadius });
-    const m = make(x, z);
-    m.position.set(x, terrainHeight(x, z), z);
-    scene.add(m);
-  }
-}
-
-// single boulders, sometimes with one or two small stones beside them
-scatter(60, () => {
-  const group = new THREE.Group();
-  const mainSize = 0.45 + Math.random() * Math.random() * 1.6;   // mostly small, a few large
-  group.add(makeRock(mainSize));
-  const extras = Math.random() < 0.5 ? 1 + ((Math.random() * 3) | 0) : 0;
-  for (let k = 0; k < extras; k++) {
-    const s = 0.15 + Math.random() * 0.35;
-    const a = Math.random() * Math.PI * 2, d = mainSize * 1.25 + s + Math.random() * 0.6;
-    const small = makeRock(s, 4);
-    small.position.x = Math.cos(a) * d;
-    small.position.z = Math.sin(a) * d;
-    group.add(small);
-  }
-  return group;
-}, 2.6);
-
-// a few kopjes: piles of big boulders you have to walk around
-for (let i = 0; i < 5; i++) {
-  let cx = 0, cz = 0;
-  do {   // anywhere but next to the waterhole
-    const angle = Math.random() * Math.PI * 2, dist = 35 + Math.random() * 135;
-    cx = Math.cos(angle) * dist; cz = Math.sin(angle) * dist;
-  } while (WATERS.some(w => Math.hypot(cx - w.x, cz - w.z) < w.r * 2.0 + 14));
-  const boulders = 4 + ((Math.random() * 4) | 0);
-  for (let k = 0; k < boulders; k++) {
-    const s = k === 0 ? 3 + Math.random() * 1.5 : 1.3 + Math.random() * 2;
-    const a = Math.random() * Math.PI * 2, d = k === 0 ? 0 : 2.5 + Math.random() * 4;
-    const x = cx + Math.cos(a) * d, z = cz + Math.sin(a) * d;
-    const rock = makeRock(s);
-    rock.position.x = x;
-    rock.position.z = z;
-    rock.position.y += terrainHeight(x, z);
-    scene.add(rock);
-    collisionBodies.push({ x, z, r: s * 1.05 });
-    obstacles.push({ x, z, r: s * 1.4 });
-  }
-}
+// (boulders, kopjes, termite mounds, bushes and trees are placed tile by tile now: see "The endless savanna" below)
 
 // ----- Wood -----
 function makeBarkTexture() {
@@ -1266,7 +1048,7 @@ function leafSet(hex) {
 // ----- Bushes: woody stems carrying loose clumps of leaves; some are dry and nearly bare -----
 const BUSH_SETS = [0x5f7f35, 0x6f8b3c, 0x4f6f30, 0x7d8f45].map(leafSet);
 const DRY_SET = leafSet(0x9d9762);
-scatter(60, () => {
+function makeBush() {
   const g = new THREE.Group();
   const s = 0.9 + Math.random() * 1.1;
   const dry = Math.random() < 0.25;
@@ -1297,7 +1079,7 @@ scatter(60, () => {
   }
   g.add(leafCloud(blobs, set.tone, 0.42));
   return mergeByMaterial(g);
-}, 2.2);
+}
 
 // ---------- Trees (with LOD) ----------
 setProgress(0.6, 'Baumkronen werden geformt…');
@@ -1393,188 +1175,646 @@ function treeVeryLow(shape, set) {
   g.add(crown);
   return g;
 }
-function addTree(x, z) {
-  const set = TREE_SETS[(Math.random() * TREE_SETS.length) | 0];
+// One acacia with all its levels of detail, to be copied wherever a tile wants a tree (the copies share the geometry).
+function makeTreeProto(set) {
   const shape = acaciaShape();
   const lod = new THREE.LOD();
   lod.addLevel(treeHigh(shape, set), 0);
   lod.addLevel(treeMid(shape, set), 110);
   lod.addLevel(treeLow(shape, set), 200);
   lod.addLevel(treeVeryLow(shape, set), 300);
-  const scale = 0.85 + Math.random() * 0.4;
-  lod.scale.setScalar(scale);
-  lod.position.set(x, terrainHeight(x, z) - 0.15, z);
-  lod.rotation.y = Math.random() * Math.PI * 2;
-  scene.add(lod);
-  lods.push(lod);
-  // collision radius = trunk area (giraffe can walk under the canopy)
-  collisionBodies.push({ x, z, r: 1.4 * scale });
-}
-for (let i = 0; i < 30; i++) {
-  // free of rocks and bushes around the trunk, and well away from the next tree
-  const spot = freeSpot(25, 180, 4);
-  if (!spot) continue;
-  obstacles.push({ x: spot.x, z: spot.z, r: 9 });
-  addTree(spot.x, spot.z);
+  return lod;
 }
 
 // ----- Termite mounds: spires of hard red earth, as tall as a zebra or taller; solid, so everything walks round them -----
-{
-  const moundMat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 1.0 });
-  const cRed = new THREE.Color(0xa8744a), cPale = new THREE.Color(0xc79a6c), cFoot = new THREE.Color(0x8a6844);
-  // one lumpy spire with its foot at the origin
-  const spire = (radius, height, x, z) => {
-    const geo = new THREE.ConeGeometry(1, 1, 18, 14, true).translate(0, 0.5, 0);
-    const p = geo.attributes.position, colors = new Float32Array(p.count * 3), col = new THREE.Color();
-    const seed = Math.random() * 50, lean = (Math.random() - 0.5) * 0.25;
-    for (let i = 0; i < p.count; i++) {
-      const u = p.getY(i);                                             // 0 = foot .. 1 = tip
-      const a = Math.atan2(p.getZ(i), p.getX(i));
-      const lump = fbm3(Math.cos(a) * 1.6 + seed, u * 3.2, Math.sin(a) * 1.6 + seed);
-      const flute = 0.5 + 0.5 * Math.sin(a * 5 + seed + u * 2);       // buttresses running up the sides
-      const r = radius * Math.pow(1 - u, 0.65) * (0.7 + 0.5 * lump + 0.18 * flute) + radius * 0.5 * Math.exp(-u * 9);
-      p.setXYZ(i, Math.cos(a) * r + x + lean * u * height, u * height - 0.2, Math.sin(a) * r + z);
-      col.copy(cRed).lerp(cPale, lump * 0.7).lerp(cFoot, Math.exp(-u * 6) * 0.6).multiplyScalar(0.8 + 0.3 * flute);
-      colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-    return geo;
-  };
-  for (let i = 0; i < 10; i++) {
-    const spot = freeSpot(30, 185, 3);
-    if (!spot) continue;
-    const size = 0.7 + Math.random() * 0.8;
-    const geos = [spire(1.3 * size, 3.6 * size, 0, 0)];
-    for (let k = (Math.random() * 3) | 0; k > 0; k--) {                // smaller spires growing out of its side
-      const a = Math.random() * Math.PI * 2, d = (0.6 + Math.random() * 0.5) * size;
-      geos.push(spire(0.75 * size, (1.4 + Math.random() * 1.4) * size, Math.cos(a) * d, Math.sin(a) * d));
-    }
-    const mound = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(geos), moundMat);
-    mound.position.set(spot.x, terrainHeight(spot.x, spot.z), spot.z);
-    mound.castShadow = true;
-    mound.receiveShadow = true;
-    scene.add(mound);
-    obstacles.push({ x: spot.x, z: spot.z, r: 2.4 * size });
-    collisionBodies.push({ x: spot.x, z: spot.z, r: 1.25 * size });
-  }
-}
-
-// ---------- Distance: the savanna carries on, with mountains on the horizon ----------
-// Beyond the detailed terrain the land carries on in two rings: a middle one, fine enough to look just like the
-// ground you walk on (same colours, same relief and cracks), and a coarse sheet out to the haze. Each is pushed
-// down underneath whatever lies inside it.
-function outerGround(size, segs, hole, sink, detailed) {
-  const cLush = new THREE.Color(0x7d9a45), cStraw = new THREE.Color(0xcab762), cGold = new THREE.Color(0xd9b24f);
-  const cEarth = new THREE.Color(0xb07f52), cDark = new THREE.Color(0x8a6844);
-  const col = new THREE.Color(), earth = new THREE.Color();
-  const geo = new THREE.PlaneGeometry(size, size, segs, segs).rotateX(-Math.PI / 2);
-  const p = geo.attributes.position;
-  const colors = new Float32Array(p.count * 3), bare = new Float32Array(p.count);
+const moundMat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 1.0 });
+const cMoundRed = new THREE.Color(0xa8744a), cMoundPale = new THREE.Color(0xc79a6c), cMoundFoot = new THREE.Color(0x8a6844);
+// one lumpy spire with its foot at the origin
+function moundSpire(radius, height, x, z) {
+  const geo = new THREE.ConeGeometry(1, 1, 18, 14, true).translate(0, 0.5, 0);
+  const p = geo.attributes.position, colors = new Float32Array(p.count * 3), col = new THREE.Color();
+  const seed = Math.random() * 50, lean = (Math.random() - 0.5) * 0.25;
   for (let i = 0; i < p.count; i++) {
-    const x = p.getX(i), z = p.getZ(i);
-    p.setY(i, Math.max(Math.abs(x), Math.abs(z)) < hole ? -25 : terrainHeight(x, z) - sink);
-    bare[i] = earthAmount(x, z);
-    const fine = 0.5 + 0.5 * Math.sin(x * 0.37 + Math.sin(z * 0.29) * 1.7) * Math.sin(z * 0.41 + 0.7);
-    col.copy(cLush).lerp(cStraw, dryness(x, z)).lerp(cGold, tintDrift(x, z) * 0.35);
-    earth.copy(cEarth).lerp(cDark, fine * 0.5);
-    col.lerp(earth, bare[i] * (detailed ? 0.8 : 0.6));
-    col.multiplyScalar(0.88 + fine * 0.14 + Math.random() * 0.08);
+    const u = p.getY(i);                                             // 0 = foot .. 1 = tip
+    const a = Math.atan2(p.getZ(i), p.getX(i));
+    const lump = fbm3(Math.cos(a) * 1.6 + seed, u * 3.2, Math.sin(a) * 1.6 + seed);
+    const flute = 0.5 + 0.5 * Math.sin(a * 5 + seed + u * 2);       // buttresses running up the sides
+    const r = radius * Math.pow(1 - u, 0.65) * (0.7 + 0.5 * lump + 0.18 * flute) + radius * 0.5 * Math.exp(-u * 9);
+    p.setXYZ(i, Math.cos(a) * r + x + lean * u * height, u * height - 0.2, Math.sin(a) * r + z);
+    col.copy(cMoundRed).lerp(cMoundPale, lump * 0.7).lerp(cMoundFoot, Math.exp(-u * 6) * 0.6).multiplyScalar(0.8 + 0.3 * flute);
     colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geo.setAttribute('bare', new THREE.BufferAttribute(bare, 1));
   geo.computeVertexNormals();
-  const tiles = size / 400 * 60;                        // the same texture size as on the detailed terrain
-  const tex = ground.material.map.clone();
-  tex.repeat.set(tiles, tiles);
-  tex.needsUpdate = true;
-  const mat = new THREE.MeshStandardMaterial({ map: tex, vertexColors: true, roughness: 1.0 });
-  if (detailed) {
-    const relief = ground.material.bumpMap.clone();
-    relief.repeat.set(tiles, tiles);
-    relief.needsUpdate = true;
-    mat.bumpMap = relief;
-    mat.onBeforeCompile = groundRelief;
-  } else mat.onBeforeCompile = breakTiling;
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.receiveShadow = detailed;
-  scene.add(mesh);
+  return geo;
 }
-outerGround(1000, 250, 190, 0.05, true);
-outerGround(3200, 256, 480, 0.25, false);
+// a whole mound of the given size: a tall spire, sometimes with smaller ones growing out of its side
+function makeMound(size) {
+  const geos = [moundSpire(1.3 * size, 3.6 * size, 0, 0)];
+  for (let k = (Math.random() * 3) | 0; k > 0; k--) {
+    const a = Math.random() * Math.PI * 2, d = (0.6 + Math.random() * 0.5) * size;
+    geos.push(moundSpire(0.75 * size, (1.4 + Math.random() * 1.4) * size, Math.cos(a) * d, Math.sin(a) * d));
+  }
+  const mound = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(geos), moundMat);
+  mound.castShadow = true;
+  mound.receiveShadow = true;
+  mound.userData.size = size;
+  return mound;
+}
 
-// The belt around the field: bushes and rocks in a simpler make, thinning out with distance like the grass.
+// ---------- The endless savanna: built in tiles around you, taken down behind you ----------
+// The land is laid out in square tiles ("chunks") of 90 x 90 units. Around you there is always a ring of tiles: the
+// ones close by are rich in detail (grass, pebbles, bushes, trees, rocks), further ones are simpler, and the furthest
+// are bare ground with a few trees. New tiles are built a little at a time at the edge of the ring while you move,
+// and tiles you have left far behind are taken down again.
+// Everything on a tile is drawn from a random generator seeded with the tile's coordinates (never Math.random), so a
+// place looks the same when you come back to it. The waters and the animals still belong to the area around the start.
+setProgress(0.7, 'Die Savanne wächst…');
+const CHUNK = 90;
+const CHUNK_SEGS = [60, 20, 8];             // ground resolution per level of detail: 1.5, 4.5 and 11.25 units between vertices
+const LEVEL_NEAR = 200, LEVEL_MID = 480, LEVEL_FAR = 1000;   // tiles closer than this get level 0 / 1 / 2; beyond LEVEL_FAR nothing
+const UNLOAD_AT = 1060, LEVEL_HYST = 25;    // a tile is only taken down (or simplified) a little later than it was built, so it does not flicker
+const SKIRT = 1.4;                          // tile edges hang down a little, so tiles of different detail leave no cracks
+const TREE_SHARE = [1, 1, 0.4];            // how many of a tile's trees are shown at each level (the far ones are very simple copies)
+const exclusions = [];                      // round places where nothing grows (the helicopter pad): {x, z, r}
+const homeTrees = [];                       // the acacias of the starting area (positions only), for the animals
+const mountains = [];                       // the two mountain rings; they move along with the camera
+
+// ----- Things every tile reuses: built once, copied (sharing their geometry) wherever the tile needs one -----
+const PROTO = { trees: [], rocks: [], stones: [], bigRocks: [], farRocks: [], bushes: [], mounds: [] };
 {
-  // one leafy lump, in two grades of fineness
-  const lump = detail => {
-    let geo = new THREE.IcosahedronGeometry(1, detail);
-    geo.deleteAttribute('normal');
-    geo.deleteAttribute('uv');
-    geo = BufferGeometryUtils.mergeVertices(geo, 1e-4);
-    const p = geo.attributes.position, colors = new Float32Array(p.count * 3);
-    for (let i = 0; i < p.count; i++) {
-      const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
-      const r = 0.72 + 0.55 * fbm3(x * 1.9 + 7, y * 1.9, z * 1.9 + 3);
-      p.setXYZ(i, x * r, y * r, z * r);
-      const k = (0.55 + 0.4 * (y * 0.5 + 0.5)) * (0.8 + 0.4 * fbm3(x * 4, y * 4 + 5, z * 4));   // darker underneath, mottled
-      colors[i * 3] = k; colors[i * 3 + 1] = k; colors[i * 3 + 2] = k;
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-    return geo;
+  for (let i = 0; i < 8; i++) PROTO.trees.push(makeTreeProto(TREE_SETS[i % TREE_SETS.length]));
+  const rock = (size, detail) => { const r = makeRock(size, detail); r.userData.size = size; return r; };
+  for (const s of [0.45, 0.65, 0.9, 1.2, 1.6, 2.1]) PROTO.rocks.push(rock(s, 8));
+  for (const s of [0.18, 0.28, 0.42]) PROTO.stones.push(rock(s, 4));
+  for (const s of [1.4, 2.1, 2.9, 3.7, 4.5]) PROTO.bigRocks.push(rock(s, 8));
+  for (const s of [0.5, 0.8, 1.2, 1.7, 2.3, 3.0, 3.8, 4.6]) PROTO.farRocks.push(rock(s, 3));
+  for (let i = 0; i < 10; i++) PROTO.bushes.push(makeBush());
+  for (const s of [0.75, 0.95, 1.15, 1.4]) PROTO.mounds.push(makeMound(s));
+}
+// A copy of a tree or bush that shares everything with the original, even the big buffers of the leaf clouds
+// (the ordinary clone() would copy those: several megabytes for every single tree).
+function cloneShared(src) {
+  if (src.isLOD) {
+    const lod = new THREE.LOD();
+    for (const lv of src.levels) lod.addLevel(cloneShared(lv.object), lv.distance, lv.hysteresis);
+    return lod;
+  }
+  let c;
+  if (src.isInstancedMesh) {
+    c = new THREE.InstancedMesh(src.geometry, src.material, 1);
+    c.instanceMatrix = src.instanceMatrix;
+    c.instanceColor = src.instanceColor;
+    c.count = src.count;
+    if (src.boundingSphere === null) src.computeBoundingSphere();
+    c.boundingSphere = src.boundingSphere.clone();
+    src.updateMatrix();
+    src.matrix.decompose(c.position, c.quaternion, c.scale);
+    c.castShadow = src.castShadow; c.receiveShadow = src.receiveShadow; c.frustumCulled = src.frustumCulled; c.renderOrder = src.renderOrder;
+  } else c = src.clone(false);
+  for (const child of src.children) c.add(cloneShared(child));
+  return c;
+}
+// the prototype whose size comes closest to `size`
+function nearestProto(list, size) {
+  let best = list[0], bd = Infinity;
+  for (const p of list) { const d = Math.abs(Math.log(p.userData.size / size)); if (d < bd) { bd = d; best = p; } }
+  return best;
+}
+// simple leafy lumps for the bushes far away, in one fineness
+const LUMP = (() => {
+  let geo = new THREE.IcosahedronGeometry(1, 1);
+  geo.deleteAttribute('normal');
+  geo.deleteAttribute('uv');
+  geo = BufferGeometryUtils.mergeVertices(geo, 1e-4);
+  const p = geo.attributes.position, colors = new Float32Array(p.count * 3);
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const r = 0.72 + 0.55 * fbm3(x * 1.9 + 7, y * 1.9, z * 1.9 + 3);
+    p.setXYZ(i, x * r, y * r, z * r);
+    const k = (0.55 + 0.4 * (y * 0.5 + 0.5)) * (0.8 + 0.4 * fbm3(x * 4, y * 4 + 5, z * 4));   // darker underneath, mottled
+    colors[i * 3] = k; colors[i * 3 + 1] = k; colors[i * 3 + 2] = k;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  return geo;
+})();
+const LUMP_TONES = [0x5f7a35, 0x6f8440, 0x7d8a45, 0x8f8a52, 0xa0935c].map(c => new THREE.Color(c));
+const lumpMat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.9 });
+
+// ----- What stands on a tile: trees, rocks, kopjes, termite mounds and bushes, as a plain list -----
+// The same list comes out every time for the same tile. Things keep clear of the waters and of each other; they stay
+// a little away from the tile's edge, so that nothing on one tile can overlap something on its neighbour.
+function chunkLayout(cx, cz) {
+  const rng = seededRng(cellHash(cx, cz, 7));
+  const x0 = (cx - 0.5) * CHUNK, z0 = (cz - 0.5) * CHUNK;
+  const placed = [];                         // {x, z, r}: what is already here
+  const free = (x, z, r) => {
+    for (const w of WATERS) if (Math.hypot(x - w.x, z - w.z) < w.r * 1.5 + r) return false;
+    for (const p of placed) if (Math.hypot(x - p.x, z - p.z) < p.r + r) return false;
+    return true;
   };
-  const lumps = [lump(2), lump(1)];
-  const tones = [0x5f7a35, 0x6f8440, 0x7d8a45, 0x8f8a52, 0xa0935c].map(c => new THREE.Color(c));
-  const near = [], far = [], m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
-  for (let i = 0; i < 380; i++) {
-    const angle = Math.random() * Math.PI * 2, dist = 192 + Math.pow(Math.random(), 1.7) * 300;
-    const bx = Math.cos(angle) * dist, bz = Math.sin(angle) * dist;
-    if (earthAmount(bx, bz) > 0.5) continue;
-    const size = 0.9 + Math.random() * 1.5, tone = tones[(Math.random() * tones.length) | 0];
-    for (let k = 1 + ((Math.random() * 3) | 0); k > 0; k--) {
-      const s = size * (0.6 + Math.random() * 0.5);
-      const x = bx + (Math.random() - 0.5) * size * 1.4, z = bz + (Math.random() - 0.5) * size * 1.4;
-      const geo = lumps[dist < 290 ? 0 : 1].clone();
-      m.compose(new THREE.Vector3(x, terrainHeight(x, z) + s * 0.45, z), q.setFromEuler(e.set(0, Math.random() * 6.3, 0)), new THREE.Vector3(s, s * (0.6 + Math.random() * 0.25), s));
-      geo.applyMatrix4(m);
-      const c = geo.attributes.color, shade = 0.85 + Math.random() * 0.3;
-      for (let j = 0; j < c.count; j++) c.setXYZ(j, c.getX(j) * tone.r * shade, c.getY(j) * tone.g * shade, c.getZ(j) * tone.b * shade);
-      (dist < 290 ? near : far).push(geo);
+  const spot = (margin, r) => {
+    for (let k = 0; k < 40; k++) {
+      const x = x0 + margin + rng() * (CHUNK - 2 * margin), z = z0 + margin + rng() * (CHUNK - 2 * margin);
+      if (free(x, z, r)) return { x, z };
+    }
+    return null;
+  };
+  const lay = { trees: [], rocks: [], kopje: null, mounds: [], bushes: [], solid: [] };   // solid: what the animals' start-up placement must avoid
+
+  const nTrees = 1 + Math.floor(rng() * 2.4);
+  for (let k = 0; k < nTrees; k++) {
+    const s = spot(7, 4);
+    if (!s) continue;
+    placed.push({ x: s.x, z: s.z, r: 9 });
+    lay.solid.push({ x: s.x, z: s.z, r: 9 });
+    lay.trees.push({ x: s.x, z: s.z, scale: 0.85 + rng() * 0.4, rot: rng() * Math.PI * 2, proto: Math.floor(rng() * PROTO.trees.length), vis: rng() });
+  }
+
+  const nRocks = 2 + Math.floor(rng() * 5);
+  for (let k = 0; k < nRocks; k++) {
+    const s = spot(4, 2.6);
+    if (!s) continue;
+    placed.push({ x: s.x, z: s.z, r: 2.6 });
+    lay.solid.push({ x: s.x, z: s.z, r: 2.6 });
+    const size = 0.45 + rng() * rng() * 1.6;     // mostly small, a few large
+    const extras = [];
+    if (rng() < 0.5) for (let e = 1 + Math.floor(rng() * 3); e > 0; e--) {   // one to three small stones beside it
+      const es = 0.15 + rng() * 0.35, a = rng() * Math.PI * 2, d = size * 1.25 + es + rng() * 0.6;
+      extras.push({ x: s.x + Math.cos(a) * d, z: s.z + Math.sin(a) * d, size: es, rot: rng() * Math.PI * 2 });
+    }
+    lay.rocks.push({ x: s.x, z: s.z, size, rot: rng() * Math.PI * 2, extras, vis: rng() });
+  }
+
+  if (rng() < 0.4) {                           // a kopje: a pile of big boulders you have to walk around
+    for (let tries = 0; tries < 20 && !lay.kopje; tries++) {
+      const kx = x0 + 16 + rng() * (CHUNK - 32), kz = z0 + 16 + rng() * (CHUNK - 32);
+      if (WATERS.some(w => Math.hypot(kx - w.x, kz - w.z) < w.r * 2.0 + 14) || !free(kx, kz, 8)) continue;
+      placed.push({ x: kx, z: kz, r: 8 });
+      const boulders = [];
+      for (let b = 4 + Math.floor(rng() * 4), k = 0; k < b; k++) {
+        const s = k === 0 ? 3 + rng() * 1.5 : 1.3 + rng() * 2, a = rng() * Math.PI * 2, d = k === 0 ? 0 : 2.5 + rng() * 4;
+        const x = kx + Math.cos(a) * d, z = kz + Math.sin(a) * d;
+        boulders.push({ x, z, size: s, rot: rng() * Math.PI * 2 });
+        lay.solid.push({ x, z, r: s * 1.4 });
+      }
+      lay.kopje = boulders;
     }
   }
-  const bushMat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.9 });
-  for (const list of [near, far]) if (list.length) scene.add(new THREE.Mesh(BufferGeometryUtils.mergeGeometries(list), bushMat));
 
-  const rocks = new THREE.Group();
-  for (let i = 0; i < 110; i++) {
-    const angle = Math.random() * Math.PI * 2, dist = 192 + Math.pow(Math.random(), 1.7) * 280;
-    const x = Math.cos(angle) * dist, z = Math.sin(angle) * dist;
-    const rock = makeRock(0.7 + Math.random() * Math.random() * 3.2, dist < 280 ? 4 : 2);
-    rock.position.x = x; rock.position.z = z; rock.position.y += terrainHeight(x, z);
-    rock.castShadow = false;
-    rocks.add(rock);
+  if (rng() < 0.65) {                          // a termite mound
+    const s = spot(7, 3);
+    if (s) {
+      const size = 0.7 + rng() * 0.8;
+      placed.push({ x: s.x, z: s.z, r: 2.4 * size });
+      lay.solid.push({ x: s.x, z: s.z, r: 2.4 * size });
+      const proto = nearestProto(PROTO.mounds, size);
+      lay.mounds.push({ x: s.x, z: s.z, proto: PROTO.mounds.indexOf(proto), scale: size / proto.userData.size, rot: rng() * Math.PI * 2 });
+    }
   }
-  scene.add(mergeByMaterial(rocks));
+
+  const nBushes = 3 + Math.floor(rng() * 5);
+  for (let k = 0; k < nBushes; k++) {
+    const s = spot(4, 2.2);
+    if (!s) continue;
+    placed.push({ x: s.x, z: s.z, r: 2.2 });
+    lay.solid.push({ x: s.x, z: s.z, r: 2.2 });
+    lay.bushes.push({ x: s.x, z: s.z, scale: 0.8 + rng() * 0.5, size: 0.9 + rng() * 1.5, rot: rng() * Math.PI * 2,
+      proto: Math.floor(rng() * PROTO.bushes.length), tone: Math.floor(rng() * LUMP_TONES.length), vis: rng() });
+  }
+  return lay;
 }
 
-// far trees: simple acacias dotted over the plain out to the haze
-{
-  const g = new THREE.Group();
-  const set = TREE_SETS[0];
-  for (let i = 0; i < 260; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const dist = 198 + Math.pow(Math.random(), 2.0) * 620;      // close together near the field, ever sparser further out
-    const x = Math.cos(angle) * dist, z = Math.sin(angle) * dist, y = terrainHeight(x, z);
-    const s = 0.8 + Math.random() * 0.5;
-    g.add(limb(new THREE.Vector3(x, y - 0.3, z), new THREE.Vector3(x + (Math.random() - 0.5) * 2, y + 10.8 * s, z + (Math.random() - 0.5) * 2), 0.8 * s, 0.4 * s, 4, trunkMat));
-    const crown = leafPad(9.0 * s, 1.3 * s, 0, set.far);
-    crown.position.set(x, y + 11.3 * s, z);
-    crown.rotation.y = Math.random() * Math.PI * 2;
-    g.add(crown);
+// ----- Building one tile -----
+// A generator: it hands control back now and then (`yield`) when the time slice of the frame is used up, so that
+// building never makes the picture stutter. It ends by returning everything the tile consists of.
+const JOB = { deadline: Infinity };
+const overBudget = () => performance.now() > JOB.deadline;
+const SCRATCH_M = new Float32Array(24000 * 16), SCRATCH_C = new Float32Array(24000 * 3);
+const GC = {   // the colours of the ground
+  lush: new THREE.Color(0x7d9a45), straw: new THREE.Color(0xcab762), gold: new THREE.Color(0xd9b24f),
+  earth: new THREE.Color(0xb07f52), dark: new THREE.Color(0x8a6844), mud: new THREE.Color(0x57452f),
+};
+const TUFT = {   // the colours of the grass
+  lush: new THREE.Color(0x7a9742), straw: new THREE.Color(0xc9b869), pale: new THREE.Color(0xddd09a),
+  goldA: new THREE.Color(0xd3bb6e), goldB: new THREE.Color(0xb79f58),
+};
+const ckP = new THREE.Vector3(), ckQ = new THREE.Quaternion(), ckS = new THREE.Vector3(), ckM = new THREE.Matrix4(), ckY = new THREE.Vector3(0, 1, 0);
+const ckDummy = new THREE.Object3D();
+
+function* buildChunk(cx, cz, level) {
+  const key = cx + ',' + cz;
+  const segs = CHUNK_SEGS[level], step = CHUNK / segs, W = segs + 1, WB = segs + 3;
+  const x0 = (cx - 0.5) * CHUNK, z0 = (cz - 0.5) * CHUNK;
+  const rng = seededRng(cellHash(cx, cz, 11 + level));
+  const group = new THREE.Group();
+  const owned = [], noRefl = [], trees = [], bodies = [];
+  const centre = new THREE.Vector3(cx * CHUNK, 3, cz * CHUNK);
+
+  // --- the ground: heights, with a border of one more vertex all round, so that the normals run on across the tile edges ---
+  const Hb = new Float32Array(WB * WB);
+  for (let j = 0; j < WB; j++) {
+    for (let i = 0; i < WB; i++) Hb[j * WB + i] = terrainHeight(x0 + (i - 1) * step, z0 + (j - 1) * step);
+    if (overBudget()) yield;
   }
-  g.traverse(o => { o.castShadow = false; });
-  scene.add(mergeByMaterial(g));
+  const nMain = W * W, nSkirt = 4 * segs, nVert = nMain + nSkirt;
+  const pos = new Float32Array(nVert * 3), nor = new Float32Array(nVert * 3), colr = new Float32Array(nVert * 3);
+  const uvs = new Float32Array(nVert * 2), bare = new Float32Array(nVert);
+  const Hv = new Float32Array(nMain);
+  const rich = level < 2;     // the fields the grass is planted by
+  const dens = rich ? new Float32Array(nMain) : null, tallF = rich ? new Float32Array(nMain) : null;
+  const depthF = rich ? new Float32Array(nMain) : null, dryF = rich ? new Float32Array(nMain) : null;
+  const col = new THREE.Color(), earth = new THREE.Color();
+  for (let j = 0; j < W; j++) {
+    for (let i = 0; i < W; i++) {
+      const v = j * W + i, x = x0 + i * step, z = z0 + j * step, hc = (j + 1) * WB + i + 1;
+      const h = Hb[hc];
+      Hv[v] = h;
+      const nx = (Hb[hc - 1] - Hb[hc + 1]) / (2 * step), nz = (Hb[hc - WB] - Hb[hc + WB]) / (2 * step);
+      const inv = 1 / Math.sqrt(nx * nx + 1 + nz * nz);
+      pos[v * 3] = x; pos[v * 3 + 1] = h; pos[v * 3 + 2] = z;
+      nor[v * 3] = nx * inv; nor[v * 3 + 1] = inv; nor[v * 3 + 2] = nz * inv;
+      uvs[v * 2] = x / 400 + 0.5; uvs[v * 2 + 1] = 0.5 - z / 400;      // one texture across the whole land
+      const be = earthAmount(x, z), dr = dryness(x, z), depth = waterDepth(x, z);
+      const fine = 0.5 + 0.5 * Math.sin(x * 0.37 + Math.sin(z * 0.29) * 1.7) * Math.sin(z * 0.41 + 0.7);   // small mottling
+      col.copy(GC.lush).lerp(GC.straw, dr).lerp(GC.gold, tintDrift(x, z) * 0.35);
+      earth.copy(GC.earth).lerp(GC.dark, fine * 0.5);
+      col.lerp(earth, be * (level === 2 ? 0.6 : 0.8));
+      // the speckle depends on the place only (not on the tile), so that neighbouring tiles agree along their edge
+      col.multiplyScalar(0.88 + fine * 0.14 + (cellHash(Math.round(x * 4), Math.round(z * 4), 5) / 4294967296) * 0.08);
+      if (depth > -0.6) {
+        col.lerp(GC.mud, smoothstep(-0.6, 0.0, depth) * 0.85);      // wet mud towards the waterline
+        col.multiplyScalar(1 - 0.5 * smoothstep(0, 1.0, depth) - 0.25 * smoothstep(1.0, 4.5, depth));   // darker the deeper the bed
+      }
+      colr[v * 3] = col.r; colr[v * 3 + 1] = col.g; colr[v * 3 + 2] = col.b;
+      bare[v] = be;
+      if (rich) { dens[v] = grassDensity(x, z); tallF[v] = tallGrassAmount(x, z); depthF[v] = depth; dryF[v] = dr; }
+    }
+    if (overBudget()) yield;
+  }
+  // the skirt: a copy of every vertex along the edge, hanging down
+  const ring = [];
+  for (let i = 0; i < segs; i++) ring.push(i);
+  for (let j = 0; j < segs; j++) ring.push(j * W + segs);
+  for (let i = segs; i > 0; i--) ring.push(segs * W + i);
+  for (let j = segs; j > 0; j--) ring.push(j * W);
+  for (let k = 0; k < nSkirt; k++) {
+    const s = nMain + k, m = ring[k];
+    pos[s * 3] = pos[m * 3]; pos[s * 3 + 1] = pos[m * 3 + 1] - SKIRT; pos[s * 3 + 2] = pos[m * 3 + 2];
+    nor[s * 3] = nor[m * 3]; nor[s * 3 + 1] = nor[m * 3 + 1]; nor[s * 3 + 2] = nor[m * 3 + 2];
+    colr[s * 3] = colr[m * 3]; colr[s * 3 + 1] = colr[m * 3 + 1]; colr[s * 3 + 2] = colr[m * 3 + 2];
+    uvs[s * 2] = uvs[m * 2]; uvs[s * 2 + 1] = uvs[m * 2 + 1];
+    bare[s] = bare[m];
+  }
+  const idx = new Uint16Array(segs * segs * 6 + nSkirt * 12);
+  let q = 0;
+  for (let j = 0; j < segs; j++) for (let i = 0; i < segs; i++) {
+    const a = j * W + i, b = a + W, c = a + 1, d = b + 1;
+    idx[q++] = a; idx[q++] = b; idx[q++] = c;
+    idx[q++] = b; idx[q++] = d; idx[q++] = c;
+  }
+  for (let k = 0; k < nSkirt; k++) {          // (drawn from both sides, so the skirt shows whichever way the crack is seen from)
+    const a = ring[k], b = ring[(k + 1) % nSkirt], a2 = nMain + k, b2 = nMain + (k + 1) % nSkirt;
+    idx[q++] = a; idx[q++] = b; idx[q++] = a2;   idx[q++] = b; idx[q++] = b2; idx[q++] = a2;
+    idx[q++] = a; idx[q++] = a2; idx[q++] = b;   idx[q++] = b; idx[q++] = a2; idx[q++] = b2;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colr, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setAttribute('bare', new THREE.BufferAttribute(bare, 1));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeBoundingSphere();
+  const tile = new THREE.Mesh(geo, level === 2 ? farGroundMat : groundMat);
+  tile.receiveShadow = level < 2;
+  group.add(tile);
+  owned.push(geo);
+  if (overBudget()) yield;
+
+  // --- lookups in the tile's grids ---
+  const samp = (arr, x, z) => {
+    let fx = (x - x0) / step, fz = (z - z0) / step;
+    let i = fx | 0, j = fz | 0;
+    if (i > segs - 1) i = segs - 1;
+    if (j > segs - 1) j = segs - 1;
+    fx -= i; fz -= j;
+    const a = j * W + i;
+    return (arr[a] * (1 - fx) + arr[a + 1] * fx) * (1 - fz) + (arr[a + W] * (1 - fx) + arr[a + W + 1] * fx) * fz;
+  };
+  const blocked = (x, z, wet) => {
+    for (const e of exclusions) if ((x - e.x) * (x - e.x) + (z - e.z) * (z - e.z) < e.r * e.r) return true;
+    return depthF !== null && samp(depthF, x, z) > -1.6 && waterDepth(x, z) > wet;
+  };
+  // --- small things in bulk: written into the scratch buffers, then turned into one instanced mesh ---
+  let nPut = 0;
+  const putMatrix = (m, r, g, b) => {
+    SCRATCH_M.set(m.elements, nPut * 16);
+    SCRATCH_C[nPut * 3] = r; SCRATCH_C[nPut * 3 + 1] = g; SCRATCH_C[nPut * 3 + 2] = b;
+    nPut++;
+  };
+  const putTuft = (x, y, z, ry, sx, sy, sz, r, g, b) => {     // (turned about the vertical only: no need for a full matrix)
+    const o = nPut * 16, cs = Math.cos(ry), sn = Math.sin(ry);
+    SCRATCH_M[o] = cs * sx; SCRATCH_M[o + 1] = 0; SCRATCH_M[o + 2] = -sn * sx; SCRATCH_M[o + 3] = 0;
+    SCRATCH_M[o + 4] = 0; SCRATCH_M[o + 5] = sy; SCRATCH_M[o + 6] = 0; SCRATCH_M[o + 7] = 0;
+    SCRATCH_M[o + 8] = sn * sz; SCRATCH_M[o + 9] = 0; SCRATCH_M[o + 10] = cs * sz; SCRATCH_M[o + 11] = 0;
+    SCRATCH_M[o + 12] = x; SCRATCH_M[o + 13] = y; SCRATCH_M[o + 14] = z; SCRATCH_M[o + 15] = 1;
+    SCRATCH_C[nPut * 3] = r; SCRATCH_C[nPut * 3 + 1] = g; SCRATCH_C[nPut * 3 + 2] = b;
+    nPut++;
+  };
+  const flush = (geometry, material) => {
+    if (nPut === 0) return;
+    const mesh = new THREE.InstancedMesh(geometry, material, nPut);
+    mesh.instanceMatrix.array.set(SCRATCH_M.subarray(0, nPut * 16));
+    mesh.instanceColor = new THREE.InstancedBufferAttribute(SCRATCH_C.slice(0, nPut * 3), 3);
+    mesh.boundingSphere = new THREE.Sphere(centre, CHUNK * 0.75 + 8);
+    mesh.receiveShadow = true;
+    group.add(mesh); owned.push(mesh); noRefl.push(mesh);
+    nPut = 0;
+  };
+  const tuftCol = new THREE.Color();
+  const fieldColour = dry => {                 // green in the dips, straw on the rises, with some spread and the odd bleached tuft
+    tuftCol.copy(TUFT.lush).lerp(TUFT.straw, Math.min(1, Math.max(0, dry + (rng() - 0.5) * 0.5)));
+    if (rng() < 0.1) tuftCol.lerp(TUFT.pale, 0.7);
+    tuftCol.multiplyScalar(0.82 + rng() * 0.34);
+  };
+  const goldColour = dry => {
+    tuftCol.copy(TUFT.goldA).lerp(TUFT.goldB, rng()).lerp(TUFT.lush, (1 - dry) * 0.35);
+    tuftCol.multiplyScalar(0.85 + rng() * 0.25);
+  };
+  // try `attempts` random spots; `chance(x, z)` is how likely a spot is taken; `put(x, z, y)` writes the thing
+  function* strew(attempts, chance, wet, put) {
+    attempts = Math.min(attempts, 23000);       // (the scratch buffers hold that many)
+    for (let t = 0; t < attempts; t++) {
+      const x = x0 + rng() * CHUNK, z = z0 + rng() * CHUNK, roll = rng();
+      if (roll <= chance(x, z) && !blocked(x, z, wet)) put(x, z, samp(Hv, x, z));
+      if ((t & 255) === 255 && overBudget()) yield;
+    }
+  }
+  const AREA = CHUNK * CHUNK;
+
+  if (level === 0) {
+    // --- grass: short turf, medium tufts and tall savanna grass in stands ---
+    yield* strew(Math.round(AREA * 2.4 * GRASS_DENSITY), (x, z) => 0.1 + 0.9 * samp(dens, x, z), -0.12, (x, z, y) => {
+      const s = 0.7 + rng() * 0.8;
+      fieldColour(samp(dryF, x, z));
+      putTuft(x, y, z, rng() * Math.PI * 2, s, s * (0.6 + rng() * 0.9), s, tuftCol.r, tuftCol.g, tuftCol.b);
+    });
+    flush(grassKinds.turf, grassKinds.mat);
+    yield* strew(Math.round(AREA * 2.1 * GRASS_DENSITY), (x, z) => { const d = samp(dens, x, z); return d * d; }, -0.12, (x, z, y) => {
+      const s = 0.6 + rng() * rng() * 1.6, dry = samp(dryF, x, z);       // mostly small, a few big ones
+      fieldColour(dry);
+      putTuft(x, y, z, rng() * Math.PI * 2, s, s * (0.7 + rng() * 0.8) * (1.25 - 0.45 * dry), s, tuftCol.r, tuftCol.g, tuftCol.b);
+    });
+    flush(grassKinds.medium, grassKinds.mat);
+    yield* strew(Math.round(AREA * 0.65 * GRASS_DENSITY), (x, z) => samp(tallF, x, z), -0.12, (x, z, y) => {
+      const s = 0.75 + rng() * 0.6;
+      goldColour(samp(dryF, x, z));
+      putTuft(x, y, z, rng() * Math.PI * 2, s, s * (0.7 + rng() * 0.7), s, tuftCol.r, tuftCol.g, tuftCol.b);
+    });
+    flush(grassKinds.tall, grassKinds.mat);
+
+    // --- pebbles, mostly on the bare earth ---
+    yield* strew(Math.round(AREA * 0.07), (x, z) => 0.08 + samp(bare, x, z), 1e9, (x, z, y) => {
+      const s = 0.06 + rng() * 0.16, tone = PEBBLES.tones[Math.floor(rng() * PEBBLES.tones.length)];
+      ckDummy.position.set(x, y + s * 0.2, z);
+      ckDummy.rotation.set(rng() * 3, rng() * 3, rng() * 3);
+      ckDummy.scale.set(s * (1 + rng() * 0.6), s * (0.5 + rng() * 0.4), s * (1 + rng() * 0.4));
+      ckDummy.updateMatrix();
+      putMatrix(ckDummy.matrix, tone.r, tone.g, tone.b);
+    });
+    flush(PEBBLES.geo, PEBBLES.mat);
+
+    // --- litter: dry stalks and twigs, clods of earth, old dung ---
+    yield* strew(Math.round(AREA * 0.09), (x, z) => 0.35 + 0.5 * samp(bare, x, z), -0.05, (x, z, y) => {
+      const len = 0.25 + rng() * rng() * 1.4, thick = 0.012 + rng() * 0.02, tone = LITTER.stalk.tones[Math.floor(rng() * 4)];
+      ckDummy.position.set(x, y + thick * 0.4, z);
+      ckDummy.rotation.set(0, rng() * Math.PI, (rng() - 0.5) * 0.12);
+      ckDummy.scale.set(len, thick, thick);
+      ckDummy.updateMatrix();
+      putMatrix(ckDummy.matrix, tone.r, tone.g, tone.b);
+    });
+    flush(LITTER.stalk.geo, LITTER_MAT);
+    yield* strew(Math.round(AREA * 0.08), (x, z) => 0.03 + 0.95 * samp(bare, x, z), -0.05, (x, z, y) => {
+      const s = 0.05 + rng() * rng() * 0.3, tone = LITTER.clod.tones[Math.floor(rng() * 4)];
+      ckDummy.position.set(x, y + s * 0.15, z);
+      ckDummy.rotation.set(rng() * 3, rng() * 3, rng() * 3);
+      ckDummy.scale.set(s * (1 + rng() * 0.8), s * (0.35 + rng() * 0.35), s * (1 + rng() * 0.5));
+      ckDummy.updateMatrix();
+      putMatrix(ckDummy.matrix, tone.r, tone.g, tone.b);
+    });
+    flush(LITTER.clod.geo, LITTER_MAT);
+    for (let heaps = 3 + Math.floor(rng() * 4); heaps > 0; heaps--) {       // heaps of dark balls, bleached with age
+      const hx = x0 + rng() * CHUNK, hz = z0 + rng() * CHUNK;
+      if (blocked(hx, hz, -0.05)) continue;
+      for (let p = 4 + Math.floor(rng() * 6); p > 0; p--) {
+        const x = Math.min(x0 + CHUNK - 0.01, Math.max(x0, hx + (rng() - 0.5) * 0.7)), z = Math.min(z0 + CHUNK - 0.01, Math.max(z0, hz + (rng() - 0.5) * 0.7));
+        const s = 0.07 + rng() * 0.07, tone = LITTER.dung.tones[Math.floor(rng() * 4)];
+        ckDummy.position.set(x, samp(Hv, x, z) + s * 0.5, z);
+        ckDummy.rotation.set(rng() * 3, rng() * 3, 0);
+        ckDummy.scale.set(s, s * 0.75, s * 1.1);
+        ckDummy.updateMatrix();
+        putMatrix(ckDummy.matrix, tone.r, tone.g, tone.b);
+      }
+    }
+    flush(LITTER.dung.geo, LITTER_MAT);
+  } else if (level === 1) {
+    // --- further out the grass is made of coarser tufts, and fewer of them ---
+    yield* strew(Math.round(AREA * 0.55 * GRASS_DENSITY), (x, z) => 0.85 * (0.12 + 0.88 * samp(dens, x, z)), -0.12, (x, z, y) => {
+      const s = 1.0 + rng() * 1.3;
+      fieldColour(samp(dryF, x, z));
+      putTuft(x, y, z, rng() * Math.PI * 2, s, s * (0.6 + rng() * 0.8), s, tuftCol.r, tuftCol.g, tuftCol.b);
+    });
+    flush(grassKinds.coarse, grassKinds.mat);
+    yield* strew(Math.round(AREA * 0.075 * GRASS_DENSITY), (x, z) => 0.85 * samp(tallF, x, z), -0.12, (x, z, y) => {
+      const s = 0.9 + rng() * 0.8;
+      goldColour(samp(dryF, x, z));
+      putTuft(x, y, z, rng() * Math.PI * 2, s, s * (0.7 + rng() * 0.7), s, tuftCol.r, tuftCol.g, tuftCol.b);
+    });
+    flush(grassKinds.coarseTall, grassKinds.mat);
+  }
+  if (overBudget()) yield;
+
+  // --- trees, rocks, mounds and bushes, from the tile's layout ---
+  const lay = chunkLayout(cx, cz);
+  for (const t of lay.trees) {
+    if (t.vis > TREE_SHARE[level]) continue;
+    const tree = cloneShared(PROTO.trees[t.proto]);
+    tree.scale.setScalar(t.scale);
+    tree.position.set(t.x, terrainHeight(t.x, t.z) - 0.15, t.z);
+    tree.rotation.y = t.rot;
+    group.add(tree);
+    trees.push(tree);
+    if (level < 2) bodies.push({ x: t.x, z: t.z, r: 1.4 * t.scale });     // collision radius = the trunk: a giraffe can walk under the crown
+  }
+  if (overBudget()) yield;
+  if (level < 2) {
+    const rocks = [];
+    const addRock = (proto, x, z, size, rot) => {
+      const scale = size / proto.userData.size;
+      const g = proto.geometry.clone();
+      proto.updateMatrix();
+      ckM.compose(ckP.set(x, terrainHeight(x, z), z), ckQ.setFromAxisAngle(ckY, rot), ckS.setScalar(scale)).multiply(proto.matrix);
+      g.applyMatrix4(ckM);
+      rocks.push(g);
+    };
+    for (const r of lay.rocks) {
+      if (level === 0) {
+        addRock(nearestProto(PROTO.rocks, r.size), r.x, r.z, r.size, r.rot);
+        for (const e of r.extras) addRock(nearestProto(PROTO.stones, e.size), e.x, e.z, e.size, e.rot);
+      } else if (r.vis < 0.4) addRock(nearestProto(PROTO.farRocks, r.size), r.x, r.z, r.size, r.rot);
+    }
+    if (lay.kopje) for (const b of lay.kopje) {
+      addRock(nearestProto(level === 0 ? PROTO.bigRocks : PROTO.farRocks, b.size), b.x, b.z, b.size, b.rot);
+      bodies.push({ x: b.x, z: b.z, r: b.size * 1.05 });
+    }
+    if (rocks.length) {
+      const merged = BufferGeometryUtils.mergeGeometries(rocks);
+      const mesh = new THREE.Mesh(merged, rockMat);
+      mesh.castShadow = level === 0;
+      mesh.receiveShadow = true;
+      group.add(mesh);
+      owned.push(merged);
+    }
+    if (level === 0) {
+      for (const m of lay.mounds) {
+        const mound = PROTO.mounds[m.proto].clone();
+        mound.scale.setScalar(m.scale);
+        mound.position.set(m.x, terrainHeight(m.x, m.z), m.z);
+        mound.rotation.y = m.rot;
+        group.add(mound);
+        bodies.push({ x: m.x, z: m.z, r: 1.25 * PROTO.mounds[m.proto].userData.size * m.scale });
+      }
+      for (const b of lay.bushes) {
+        const bush = cloneShared(PROTO.bushes[b.proto]);
+        bush.scale.setScalar(b.scale);
+        bush.position.set(b.x, terrainHeight(b.x, b.z), b.z);
+        bush.rotation.y = b.rot;
+        group.add(bush);
+      }
+    } else {
+      const lumps = [], lr = seededRng(cellHash(cx, cz, 23));
+      for (const b of lay.bushes) {
+        if (earthAmount(b.x, b.z) > 0.5) continue;
+        const tone = LUMP_TONES[b.tone];
+        for (let k = 1 + Math.floor(lr() * 3); k > 0; k--) {
+          const s = b.size * (0.6 + lr() * 0.5);
+          const x = b.x + (lr() - 0.5) * b.size * 1.4, z = b.z + (lr() - 0.5) * b.size * 1.4;
+          const g = LUMP.clone();
+          ckM.compose(ckP.set(x, terrainHeight(x, z) + s * 0.45, z), ckQ.setFromAxisAngle(ckY, lr() * 6.3), ckS.set(s, s * (0.6 + lr() * 0.25), s));
+          g.applyMatrix4(ckM);
+          const c = g.attributes.color, shade = 0.85 + lr() * 0.3;
+          for (let i = 0; i < c.count; i++) c.setXYZ(i, c.getX(i) * tone.r * shade, c.getY(i) * tone.g * shade, c.getZ(i) * tone.b * shade);
+          lumps.push(g);
+        }
+      }
+      if (lumps.length) {
+        const merged = BufferGeometryUtils.mergeGeometries(lumps);
+        group.add(new THREE.Mesh(merged, lumpMat));
+        owned.push(merged);
+      }
+    }
+  }
+  return { group, owned, noRefl, trees, bodies };
+}
+
+// ----- Keeping the ring of tiles around the camera -----
+const chunks = new Map();                   // "cx,cz" -> { cx, cz, level, group, owned, noRefl, trees, bodies }
+const world = { px: 1e9, pz: 1e9, jobs: [], active: null, needPlan: true };
+function dropFrom(list, items) {            // remove `items` from `list` in place (other code holds on to the array itself)
+  if (!items.length) return;
+  const gone = new Set(items);
+  let w = 0;
+  for (let r = 0; r < list.length; r++) if (!gone.has(list[r])) list[w++] = list[r];
+  list.length = w;
+}
+function releaseChunk(ch) {
+  scene.remove(ch.group);
+  dropFrom(noReflection, ch.noRefl);
+  dropFrom(lods, ch.trees);
+  dropFrom(collisionBodies, ch.bodies);
+  for (const o of ch.owned) o.dispose();
+}
+function commitChunk(job, built) {
+  const here = Math.hypot(job.cx * CHUNK - world.px, job.cz * CHUNK - world.pz);
+  if (here > UNLOAD_AT) { for (const o of built.owned) o.dispose(); return; }     // we have moved on: not needed any more
+  const old = chunks.get(job.key);
+  const ch = { cx: job.cx, cz: job.cz, level: job.level, group: built.group, owned: built.owned, noRefl: built.noRefl, trees: built.trees, bodies: built.bodies };
+  scene.add(ch.group);
+  noReflection.push(...ch.noRefl);
+  lods.push(...ch.trees);
+  collisionBodies.push(...ch.bodies);
+  if (old) releaseChunk(old);               // the new tile is already in place, so there is no gap
+  chunks.set(job.key, ch);
+  world.needPlan = true;
+}
+// which level of detail a tile at distance d should have; `cur` is what it has now (-1 = nothing yet)
+function levelFor(d, cur) {
+  if (cur === 0) return d > LEVEL_NEAR + LEVEL_HYST ? (d > LEVEL_MID + LEVEL_HYST ? 2 : 1) : 0;
+  if (cur === 1) return d < LEVEL_NEAR ? 0 : d > LEVEL_MID + LEVEL_HYST ? 2 : 1;
+  if (cur === 2) return d < LEVEL_NEAR ? 0 : d < LEVEL_MID ? 1 : 2;
+  return d < LEVEL_NEAR ? 0 : d < LEVEL_MID ? 1 : 2;
+}
+// work out which tiles to take down and which to build or improve, nearest first
+function planWorld(px, pz, initial) {
+  world.px = px; world.pz = pz; world.needPlan = false;
+  for (const [key, ch] of chunks) {
+    if (Math.hypot(ch.cx * CHUNK - px, ch.cz * CHUNK - pz) > UNLOAD_AT) { releaseChunk(ch); chunks.delete(key); }
+  }
+  const jobs = [], R = Math.ceil(LEVEL_FAR / CHUNK) + 1, pcx = Math.round(px / CHUNK), pcz = Math.round(pz / CHUNK);
+  for (let cz = pcz - R; cz <= pcz + R; cz++) for (let cx = pcx - R; cx <= pcx + R; cx++) {
+    const d = Math.hypot(cx * CHUNK - px, cz * CHUNK - pz);
+    if (d > LEVEL_FAR) continue;
+    const key = cx + ',' + cz, ch = chunks.get(key);
+    let level = levelFor(d, ch ? ch.level : -1);
+    if (!ch && !initial) level = Math.max(level, 1);        // a new tile first appears in a cheap form; the rich one follows
+    if (ch && ch.level === level) continue;
+    if (world.active && world.active.key === key && world.active.level === level) continue;
+    jobs.push({ key, cx, cz, level, prio: d + (ch ? 400 : 0), gen: null });     // (tiles with a hole come before upgrades)
+  }
+  jobs.sort((a, b) => a.prio - b.prio);
+  world.jobs = jobs;
+}
+// called every frame: builds for at most `budgetMs`
+function streamWorld(px, pz, budgetMs) {
+  if (world.needPlan || Math.hypot(px - world.px, pz - world.pz) > 10) planWorld(px, pz, false);
+  JOB.deadline = performance.now() + budgetMs;
+  while (performance.now() < JOB.deadline) {
+    if (!world.active) {
+      const job = world.jobs.shift();
+      if (!job) return;
+      job.gen = buildChunk(job.cx, job.cz, job.level);
+      world.active = job;
+    }
+    const r = world.active.gen.next();
+    if (!r.done) return;                    // time is up: carry on next frame
+    const job = world.active;
+    world.active = null;
+    commitChunk(job, r.value);
+  }
+}
+// at start-up: build the whole ring at once, behind the loading screen
+{
+  planWorld(0, 0, true);
+  const total = world.jobs.length;
+  JOB.deadline = Infinity;
+  let done = 0;
+  while (world.jobs.length) {
+    const job = world.jobs.shift();
+    const gen = buildChunk(job.cx, job.cz, job.level);
+    let r = gen.next();
+    while (!r.done) r = gen.next();
+    commitChunk(job, r.value);
+    if ((++done & 15) === 0) setProgress(0.7 + 0.15 * done / total, 'Die Savanne wächst…');
+  }
+  world.needPlan = true;
+  // what stands in the starting area: nothing placed later (animals, vehicles) may overlap it, and the animals look for acacias here
+  for (let cz = -2; cz <= 2; cz++) for (let cx = -2; cx <= 2; cx++) {
+    const lay = chunkLayout(cx, cz);
+    for (const o of lay.solid) obstacles.push(o);
+    for (const t of lay.trees) if (Math.hypot(t.x, t.z) < 190) homeTrees.push({ position: { x: t.x, z: t.z }, scale: { x: t.scale } });
+  }
 }
 
 // mountains: two hazy ranges. They are tinted from the sky colour every frame, so they
@@ -1620,6 +1860,7 @@ function mountainRange(radius, depth, maxHeight, seed, peakShade) {
   const m = new THREE.Mesh(geo, mountainMat);
   m.frustumCulled = false;
   scene.add(m);
+  mountains.push(m);       // (it travels with the camera, so the horizon never gets any closer)
 }
 mountainRange(1650, 380, 330, 11.3, 0.84);   // far, pale range
 mountainRange(1200, 300, 170, 4.7, 0.66);    // nearer, darker foothills
@@ -2218,7 +2459,6 @@ function updateWarthogs(dt) {
       const ox = nx - b.x, oz = nz - b.z, d = Math.hypot(ox, oz), minD = b.r + 0.8 * h.size;
       if (d < minD && d > 0.0001) { nx += (ox / d) * (minD - d); nz += (oz / d) * (minD - d); }
     }
-    if (h === playerAnimal) { const r = Math.hypot(nx, nz); if (r > 175) { nx *= 175 / r; nz *= 175 / r; } }
     h.x = nx; h.z = nz;
     h.root.position.set(nx, standHeight(nx, nz, 1.1 * h.size), nz);     // in deep water it swims
     h.root.rotation.y = h.heading;
@@ -3161,6 +3401,7 @@ let heliPad = { x: -50, z: -40 };
   pad.position.set(heliPad.x, padY, heliPad.z);
   pad.receiveShadow = true;
   scene.add(pad);
+  exclusions.push({ x: heliPad.x, z: heliPad.z, r: 13.4 });   // tiles built later keep the pad free as well
   heli.position.set(heliPad.x, padY, heliPad.z);
   heli.rotation.y = 0.6;
 }
@@ -3318,7 +3559,7 @@ const characters = [
     yaw: 0, speed: 0, phase: 0, terrainY: 0,
     moveSpeed: 15, turnSpeed: 2.8, radius: 1.3, groundOffset: 0, sprintTime: 5, stamina: 1, canJump: true, wade: 2.3,
     camDist: 12, camHeight: 5.5, lookHeight: 2.6, slopeSpan: 1.8, slopeLean: 1.0 },
-  // flying: never stops (cruise = speed with no key pressed), ignores obstacles, may leave the field up to `range`
+  // flying: never stops (cruise = speed with no key pressed) and ignores obstacles
   { name: 'Adler', root: eagle, pose: poseEagle,
     yaw: 0, speed: 17, phase: 0, terrainY: 0,
     moveSpeed: 30, cruise: 17, turnSpeed: 1.6, radius: 0, groundOffset: 0,
@@ -3507,9 +3748,12 @@ for (let i = 0; i < 26; i++) {
   scene.add(cloud);
 }
 function updateClouds(dt) {
+  const cx = camera.position.x, cz = camera.position.z;
   for (const cloud of clouds) {
     cloud.position.x += cloud.userData.speed * dt;
-    if (cloud.position.x > 2200) cloud.position.x = -2200;       // come back in on the other side
+    // a cloud that has fallen far behind comes back in on the other side, so there are always clouds around you
+    if (cloud.position.x - cx > 2200) cloud.position.x -= 4400; else if (cloud.position.x - cx < -2200) cloud.position.x += 4400;
+    if (cloud.position.z - cz > 2200) cloud.position.z -= 4400; else if (cloud.position.z - cz < -2200) cloud.position.z += 4400;
   }
 }
 
@@ -4309,7 +4553,7 @@ function updateHerd(herd, dt, time) {
     if (herd.timer <= 0) {
       // in the midday heat: head for the nearest tree and stay in its shade
       let shade = null, shadeDist = 80;
-      if (hot) for (const tree of lods) {
+      if (hot) for (const tree of homeTrees) {
         const d = Math.hypot(tree.position.x - herd.x, tree.position.z - herd.z);
         if (d < shadeDist) { shadeDist = d; shade = tree.position; }
       }
@@ -4415,7 +4659,6 @@ function updateHerd(herd, dt, time) {
     // wedged between rocks for a while? Then it squeezes through, rather than being left behind for good
     a.stuck = Math.max(0, (a.stuck || 0) + (bumped ? dt : -dt * 0.5));
     if (a.stuck > 2.5) { a.stuck = 0; a.squeeze = 2.5; }
-    if (steered) { const r = Math.hypot(nx, nz); if (r > 175) { nx *= 175 / r; nz *= 175 / r; } }   // the player stays on the field
     a.x = nx; a.z = nz;
     a.root.position.set(nx, standHeight(nx, nz, kind.wade * a.size), nz);   // in water deeper than it can wade, it swims
     a.root.rotation.y = a.heading;
@@ -4916,6 +5159,7 @@ function updateWeather(dt, time) {
   w.wet = Math.min(1, Math.max(0, w.wet + (w.rain > 0.05 ? w.rain * dt / 20 : -dt / 220)));
   wetGrassMat.color.setRGB(1 - 0.22 * w.wet, 1 - 0.02 * w.wet, 1 - 0.3 * w.wet);     // lusher, deeper green
   ground.material.color.setRGB(1 - 0.24 * w.wet, 1 - 0.18 * w.wet, 1 - 0.3 * w.wet); // darker, damp soil
+  farGroundMat.color.copy(ground.material.color);
 
   // ----- lightning -----
   if (w.storm > 0.85 && w.phase !== 'clearing' && time > w.nextFlash) {
@@ -5580,10 +5824,10 @@ function shorePoint(w, angle) {
 }
 // a random acacia within `range` of the animal (and inside the playing field), with a place to stand beside it
 function treeSpot(pos, range, gap) {
-  const near = lods.filter(t => Math.hypot(t.position.x, t.position.z) < 165
+  const near = homeTrees.filter(t => Math.hypot(t.position.x, t.position.z) < 165
     && Math.hypot(t.position.x - pos.x, t.position.z - pos.z) < range
     && Math.hypot(t.position.x - pos.x, t.position.z - pos.z) > 8);
-  const tree = (near.length ? near : lods)[(Math.random() * (near.length || lods.length)) | 0];
+  const tree = (near.length ? near : homeTrees)[(Math.random() * (near.length || homeTrees.length)) | 0];
   const a = Math.atan2(pos.z - tree.position.z, pos.x - tree.position.x);      // approach from the side it is on
   const reach = 1.4 * tree.scale.x + gap;
   return { x: tree.position.x + Math.cos(a) * reach, z: tree.position.z + Math.sin(a) * reach, faceX: tree.position.x, faceZ: tree.position.z };
@@ -5686,9 +5930,9 @@ function updateDayNight(dt) {
   const focus = current.root.position;
   sun.target.position.set(Math.round(focus.x / 4) * 4, 0, Math.round(focus.z / 4) * 4);
   sun.position.copy(dir).multiplyScalar(150).add(sun.target.position);
-  sunMesh.position.copy(dir).multiplyScalar(2300);
+  sunMesh.position.copy(dir).multiplyScalar(2300).add(camera.position);       // sun and moon travel with the camera, like the sky
   moon.position.copy(dir).multiplyScalar(-150);
-  moonMesh.position.copy(dir).multiplyScalar(-2300);
+  moonMesh.position.copy(dir).multiplyScalar(-2300).add(camera.position);
 
   const day = smoothstep(-0.15, 0.25, sunH); // 0 night .. 1 day
   const night = 1 - day;
@@ -6680,8 +6924,6 @@ function animate() {
       // a helicopter hovers: it only moves when flown, and only once it is off the ground
       if (c.heli) target = !active || c.alt - c.terrainY < 3 ? 0 : (keys['w'] || keys['arrowup']) ? c.moveSpeed : (keys['s'] || keys['arrowdown']) ? -c.moveSpeed * 0.3 : 0;
       if (!active && !c.heli) c.yaw += 0.25 * dt;
-      // near the edge of its range it swings back towards the middle by itself
-      if (!c.heli && Math.hypot(pos.x, pos.z) > c.range * 0.9) c.yaw = lerpAngle(c.yaw, Math.atan2(-pos.x, -pos.z), Math.min(1, dt * 1.2));
     }
     // not being steered: giraffe and lion decide for themselves where to go (and how fast)
     if (!active && c.brain) target = c.brain(c, dt, time);
@@ -6749,14 +6991,7 @@ function animate() {
     if (blocked) c.speed = Math.max(-c.moveSpeed * 0.35, Math.min(c.moveSpeed * 0.45, c.speed));
     c.bumped = blocked;
 
-    // keep inside the arena
-    const R = c.range || 175;
-    const dist = Math.hypot(pos.x, pos.z);
-    if (dist > R) {
-      pos.x *= R / dist;
-      pos.z *= R / dist;
-      if (!c.flying) c.speed = 0;                  // a bird just slides along the edge
-    }
+    // (there is no arena any more: the land is made as you go)
 
     // stand on the terrain and play the walk / idle animation
     c.terrainY = c.flying && !c.heli ? terrainHeight(pos.x, pos.z) : standHeight(pos.x, pos.z, c.wade);   // in deep water it swims
@@ -6808,11 +7043,15 @@ function animate() {
   }
 
   // LOD selection
+  // the land grows ahead of you and is taken down behind you (a few milliseconds of building per frame)
+  streamWorld(camera.position.x, camera.position.z, 4);
   for (const l of lods) l.update(camera);
 
   photoUpdate(realDt);
   controls.update();
   skyDome.position.copy(camera.position);
+  stars.position.copy(camera.position);
+  for (const m of mountains) m.position.set(camera.position.x, 0, camera.position.z);
   // never let the camera dip into a hill
   const camFloor = terrainHeight(camera.position.x, camera.position.z) + (photo.active ? 0.4 : 1.5);
   if (camera.position.y < camFloor) camera.position.y = camFloor;
